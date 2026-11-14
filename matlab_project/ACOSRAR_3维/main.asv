@@ -1,0 +1,663 @@
+clear; clc; close all;
+%% ===================== 1. 全局参数初始化（不变） =====================
+% 1.1 地图参数（不变）
+map_range = [0, 100];          
+grid_step = 1;  
+x_nodes = map_range(1):grid_step:map_range(2);
+y_nodes = map_range(1):grid_step:map_range(2);
+z_nodes = map_range(1):grid_step:map_range(2);
+[X_grid, Y_grid, Z_grid] = meshgrid(x_nodes, y_nodes, z_nodes);
+node_num = length(x_nodes) * length(y_nodes) * length(z_nodes);
+% 1.2 无人机与路径参数（不变）
+start_point = [10, 90, 30];    % 起点
+end_point = [90, 10, 70];      % 终点
+safe_dist = 3;                 
+ant_num = 50;                  
+max_iter = 100;                
+beta = 2.0;                    
+K = 100;                       
+rho_global = 0.3;              
+alpha_val = 1.2;               
+rho = 0.2;                     
+% 平滑约束（不变）
+smooth_angle = 15;  
+smooth_weight = 0.5;
+smooth_nodes = 200; 
+% 方向约束（不变）
+dir_start_end = (end_point - start_point)/norm(end_point - start_point);
+max_dir_angle = 60;  
+max_dist_to_line = 15;
+% 双向搜索参数（不变）
+ant_num_start = floor(ant_num/2);
+ant_num_end = ant_num - ant_num_start;
+meet_threshold = grid_step * 2;
+% 1.3 动态障碍参数（仅注释，不删除）
+ball_r = 2;                    
+n_ball = 50;                    
+speed = 1/(4*pi);               
+speed_line = 0.8;               
+min_distance = 1;               
+[X_ball, Y_ball, Z_ball] = sphere(n_ball);  
+%% ===================== 2. 调用独立地图绘制函数（核心改动1：接收山地参数） =====================
+[fig_handle, obstacle_static, cylinder_position, cylinder_r, cylinder_r9, cylinder_r10, ...
+ mountain_x, mountain_y, mountain_x2, mountain_y2, mountain_A_max, mountain_A_max2, sigma] = create_environment_map(...
+    map_range, grid_step, x_nodes, y_nodes, z_nodes, safe_dist);
+%% ===================== 3. ACOSRAR算法核心模块（优化：终点收敛+自然引导） =====================
+% 3.1 初始化信息素（优化：终点信息素平衡引导与平滑）
+tau_L = ones(size(X_grid)) * 1;  
+tau_R = ones(size(X_grid)) * 1;  
+tau_E = ones(size(X_grid)) * 1;  
+% 预铺中间路径高信息素（不变）
+line_steps = round(norm(end_point - start_point)/grid_step);
+for step=0:line_steps
+    line_node = start_point + step*grid_step*dir_start_end;
+    if line_node(1)<map_range(1) || line_node(1)>map_range(2) || ...
+       line_node(2)<map_range(1) || line_node(2)>map_range(2) || ...
+       line_node(3)<map_range(1) || line_node(3)>map_range(2)
+        continue;
+    end
+    [~, i] = min(abs(x_nodes - line_node(1)));
+    [~, j] = min(abs(y_nodes - line_node(2)));
+    [~, k] = min(abs(z_nodes - line_node(3)));
+    if ~obstacle_static(i,j,k)
+        tau_L(i,j,k) = 8;
+    end
+end
+% 优化：终点信息素浓度=6（平衡引导与平滑，避免硬拐）
+[~, i_end] = min(abs(x_nodes - end_point(1)));
+[~, j_end] = min(abs(y_nodes - end_point(2)));
+[~, k_end] = min(abs(z_nodes - end_point(3)));
+if ~obstacle_static(i_end,j_end,k_end)
+    tau_L(i_end,j_end,k_end) = 6;
+end
+tau_total = 0.6*tau_L + 0.25*tau_R + 0.15*tau_E;  
+% 3.2 记录全局最优路径（不变）
+global_best_path = [];
+global_best_F = inf;  
+wL = 0.6; wR = 0.25; wE = 0.15;  
+w_dist_line = 0.1;
+% 3.3 算法主循环（双向搜索+自然引导优化）
+for iter = 1:max_iter
+    % ---------------------- 3.3.1 状态识别（不变）----------------------
+    if mod(iter, 5) == 0
+        scout_num = round(ant_num * 0.1);
+        Tj_sum = 0; Pj_sum = 0;
+        for s=1:scout_num
+            sample_num = 50;
+            for samp=1:sample_num
+                i = randi(length(x_nodes)); j = randi(length(y_nodes)); k = randi(length(z_nodes));
+                x = x_nodes(i); y = y_nodes(j); z = z_nodes(k);
+                
+                neighbor = obstacle_static(max(1,i-1):min(length(x_nodes),i+1), ...
+                                          max(1,j-1):min(length(y_nodes),j+1), ...
+                                          max(1,k-1):min(length(z_nodes),k+1));
+                Tj = sum(neighbor(:)) / numel(neighbor);
+                Tj_sum = Tj_sum + Tj;
+                
+                dist_to_line = norm(cross([x,y,z]-start_point, dir_start_end));
+                Pj = max(0, min(dist_to_line/30, 0.4));
+                Pj_sum = Pj_sum + Pj;
+            end
+        end
+        avg_Tj = Tj_sum / (scout_num * sample_num);
+        avg_Pj = Pj_sum / (scout_num * sample_num);
+        R = avg_Tj + avg_Pj;
+        if R < 0.3          
+            alpha_val = 1.8; rho = 0.15;
+        elseif R < 0.6      
+            alpha_val = 1.2; rho = 0.2;
+        else                
+            alpha_val = 0.9; rho = 0.22;
+        end
+        fprintf("迭代%d：环境状态S%d（R=%.2f），α=%.1f，ρ=%.3f\n", iter, ceil(R/0.3), R, alpha_val, rho);
+    end
+    
+    % ---------------------- 3.3.2 双向蚁群路径搜索（优化：自然趋近终点）----------------------
+    ant_paths = cell(ant_num, 1);
+    ant_F = ones(ant_num, 1) * inf;
+    % 1. 起点出发的蚂蚁（ant 1~ant_num_start）
+    for ant=1:ant_num_start
+        current_node = start_point;
+        path = current_node;
+        visited = false(size(X_grid));
+        [~, i] = min(abs(x_nodes - current_node(1)));
+        [~, j] = min(abs(y_nodes - current_node(2)));
+        [~, k] = min(abs(z_nodes - current_node(3)));
+        visited(i,j,k) = true;
+        path_valid = false;
+        search_count = 0;
+        max_search = 200;
+        
+        % 优化1：搜索终止条件改为"距离终点≤0.5米"（精确收敛）
+        while norm(current_node - end_point) > 0.5 && search_count < max_search
+            search_count = search_count + 1;
+            candidates = [];
+            % 扩展邻域至5×5×5（不变）
+            for di=-2:2
+                for dj=-2:2
+                    for dk=-2:2
+                        if di==0 && dj==0 && dk==0; continue; end
+                        ni = i + di; nj = j + dj; nk = k + dk;
+                        if ni>=1 && ni<=length(x_nodes) && nj>=1 && nj<=length(y_nodes) && nk>=1 && nk<=length(z_nodes) ...
+                                && ~visited(ni,nj,nk) && ~obstacle_static(ni,nj,nk)
+                            cand_node = [x_nodes(ni), y_nodes(nj), z_nodes(nk)];
+                            dir_cand = (cand_node - current_node)/norm(cand_node - current_node + eps);
+                            angle_to_end = acos(dot(dir_cand, dir_start_end)) * 180/pi;
+                            dist_to_line_cand = norm(cross(cand_node - start_point, dir_start_end));
+                            if angle_to_end <= max_dir_angle && dist_to_line_cand <= max_dist_to_line
+                                candidates = [candidates; ni, nj, nk, dist_to_line_cand];
+                            end
+                        end
+                    end
+                end
+            end
+            
+            if isempty(candidates)
+                if size(path,1) > 1
+                    path = path(1:end-1,:);
+                    current_node = path(end,:);
+                    [~, i] = min(abs(x_nodes - current_node(1)));
+                    [~, j] = min(abs(y_nodes - current_node(2)));
+                    [~, k] = min(abs(z_nodes - current_node(3)));
+                else
+                    break;
+                end
+                continue;
+            end
+            
+            % 优化2：终点启发因子放大1.5倍，增强自然引导
+            prob = zeros(size(candidates,1), 1);
+            for c=1:size(candidates,1)
+                ci = candidates(c,1); cj = candidates(c,2); ck = candidates(c,3);
+                dist_to_line_cand = candidates(c,4);
+                cand_node = [x_nodes(ci), y_nodes(cj), z_nodes(ck)];
+                
+                tau = tau_total(ci,cj,ck);
+                dist_end = norm(cand_node - end_point);
+                eta = 1/(dist_end + eps) * 1.5;  % 放大终点吸引，避免偏离后硬拐
+                smooth_factor = 1;
+                if size(path,1) >= 2
+                    vec1 = current_node - path(end-1,:);
+                    vec2 = cand_node - current_node;
+                    angle = acos(dot(vec1, vec2)/(norm(vec1)*norm(vec2)+eps)) * 180/pi;
+                    smooth_factor = max(0, cos(angle * pi/180));
+                end
+                dist_penalty = 1/(1 + w_dist_line*dist_to_line_cand);
+                
+                weight = tau^alpha_val * eta^beta * (smooth_factor^smooth_weight) * dist_penalty;
+                prob(c) = max(0, weight);
+            end
+            
+            sum_prob = sum(prob);
+            if sum_prob < 1e-10
+                prob = ones(size(prob)) / length(prob);
+            else
+                prob = prob / sum_prob;
+            end
+            
+            selected = randsample(size(candidates,1), 1, true, prob);
+            i = candidates(selected,1); j = candidates(selected,2); k = candidates(selected,3);
+            
+            current_node = [x_nodes(i), y_nodes(j), z_nodes(k)];
+            path = [path; current_node];
+            visited(i,j,k) = true;
+            path_valid = true;
+        end
+        
+        % 计算目标函数（优化：添加终点偏离惩罚）
+        if path_valid && size(path,1) >= 2
+            L = 0;
+            for p=2:size(path,1)
+                L = L + norm(path(p,:) - path(p-1,:));
+            end
+            R_path = 0;
+            dist_line_total = 0;
+            for p=1:size(path,1)
+                x = path(p,1); y = path(p,2); z = path(p,3);
+                min_static_dist = inf;
+                for c=1:length(cylinder_position)
+                    cx = cylinder_position{c}(1); cy=cylinder_position{c}(2); cr=cylinder_r;
+                    if c==9; cr=cylinder_r9; elseif c==10; cr=cylinder_r10; end
+                    dist = sqrt((x-cx)^2+(y-cy)^2) - (cr + safe_dist);
+                    min_static_dist = min(min_static_dist, dist);
+                end
+                mtn_h1 = mountain_A_max*exp(-((x-mountain_x)^2+(y-mountain_y)^2)/(2*sigma^2));
+                min_static_dist = min(min_static_dist, z - mtn_h1 - safe_dist);
+                dist_to_line = norm(cross([x,y,z]-start_point, dir_start_end));
+                dist_line_total = dist_line_total + dist_to_line;
+                R_path = R_path + max(0, -min_static_dist);
+            end
+            R_path = R_path / size(path,1);
+            dist_line_avg = dist_line_total / size(path,1);
+            E = 0;
+            for p=2:size(path,1)
+                E = E + abs(path(p,3) - path(p-1,3));
+            end
+            % 优化：终点偏离惩罚（偏离越远F越大，避免硬拐凑终点）
+            dist_final = norm(path(end,:) - end_point);
+            F = wL*L + wR*R_path + wE*E + w_dist_line*dist_line_avg + 0.3*dist_final;
+            ant_paths{ant} = path;
+            ant_F(ant) = F;
+        else
+            ant_paths{ant} = [];
+            ant_F(ant) = inf;
+        end
+    end
+    
+    % 2. 终点出发的蚂蚁（ant_num_start+1~ant_num）
+    for ant=ant_num_start+1:ant_num
+        current_node = end_point;
+        path = current_node;
+        visited = false(size(X_grid));
+        [~, i] = min(abs(x_nodes - current_node(1)));
+        [~, j] = min(abs(y_nodes - current_node(2)));
+        [~, k] = min(abs(z_nodes - current_node(3)));
+        visited(i,j,k) = true;
+        path_valid = false;
+        search_count = 0;
+        max_search = 200;
+        dir_end_start = -dir_start_end;
+        
+        % 优化1：搜索终止条件改为"距离起点≤0.5米"
+        while norm(current_node - start_point) > 0.5 && search_count < max_search
+            search_count = search_count + 1;
+            candidates = [];
+            for di=-2:2
+                for dj=-2:2
+                    for dk=-2:2
+                        if di==0 && dj==0 && dk==0; continue; end
+                        ni = i + di; nj = j + dj; nk = k + dk;
+                        if ni>=1 && ni<=length(x_nodes) && nj>=1 && nj<=length(y_nodes) && nk>=1 && nk<=length(z_nodes) ...
+                                && ~visited(ni,nj,nk) && ~obstacle_static(ni,nj,nk)
+                            cand_node = [x_nodes(ni), y_nodes(nj), z_nodes(nk)];
+                            dir_cand = (cand_node - current_node)/norm(cand_node - current_node + eps);
+                            angle_to_start = acos(dot(dir_cand, dir_end_start)) * 180/pi;
+                            dist_to_line_cand = norm(cross(cand_node - start_point, dir_start_end));
+                            if angle_to_start <= max_dir_angle && dist_to_line_cand <= max_dist_to_line
+                                candidates = [candidates; ni, nj, nk, dist_to_line_cand];
+                            end
+                        end
+                    end
+                end
+            end
+            
+            if isempty(candidates)
+                if size(path,1) > 1
+                    path = path(1:end-1,:);
+                    current_node = path(end,:);
+                    [~, i] = min(abs(x_nodes - current_node(1)));
+                    [~, j] = min(abs(y_nodes - current_node(2)));
+                    [~, k] = min(abs(z_nodes - current_node(3)));
+                else
+                    break;
+                end
+                continue;
+            end
+            
+            % 优化2：起点启发因子放大1.5倍，增强自然引导
+            prob = zeros(size(candidates,1), 1);
+            for c=1:size(candidates,1)
+                ci = candidates(c,1); cj = candidates(c,2); ck = candidates(c,3);
+                dist_to_line_cand = candidates(c,4);
+                cand_node = [x_nodes(ci), y_nodes(cj), z_nodes(ck)];
+                
+                tau = tau_total(ci,cj,ck);
+                dist_end = norm(cand_node - start_point);
+                eta = 1/(dist_end + eps) * 1.5;  % 放大起点吸引
+                smooth_factor = 1;
+                if size(path,1) >= 2
+                    vec1 = current_node - path(end-1,:);
+                    vec2 = cand_node - current_node;
+                    angle = acos(dot(vec1, vec2)/(norm(vec1)*norm(vec2)+eps)) * 180/pi;
+                    smooth_factor = max(0, cos(angle * pi/180));
+                end
+                dist_penalty = 1/(1 + w_dist_line*dist_to_line_cand);
+                
+                weight = tau^alpha_val * eta^beta * (smooth_factor^smooth_weight) * dist_penalty;
+                prob(c) = max(0, weight);
+            end
+            
+            sum_prob = sum(prob);
+            if sum_prob < 1e-10
+                prob = ones(size(prob)) / length(prob);
+            else
+                prob = prob / sum_prob;
+            end
+            
+            selected = randsample(size(candidates,1), 1, true, prob);
+            i = candidates(selected,1); j = candidates(selected,2); k = candidates(selected,3);
+            
+            current_node = [x_nodes(i), y_nodes(j), z_nodes(k)];
+            path = [path; current_node];
+            visited(i,j,k) = true;
+            path_valid = true;
+        end
+        
+        % 计算目标函数（优化：添加起点偏离惩罚）
+        if path_valid && size(path,1) >= 2
+            path = flip(path,1);
+            L = 0;
+            for p=2:size(path,1)
+                L = L + norm(path(p,:) - path(p-1,:));
+            end
+            R_path = 0;
+            dist_line_total = 0;
+            for p=1:size(path,1)
+                x = path(p,1); y = path(p,2); z = path(p,3);
+                min_static_dist = inf;
+                for c=1:length(cylinder_position)
+                    cx = cylinder_position{c}(1); cy=cylinder_position{c}(2); cr=cylinder_r;
+                    if c==9; cr=cylinder_r9; elseif c==10; cr=cylinder_r10; end
+                    dist = sqrt((x-cx)^2+(y-cy)^2) - (cr + safe_dist);
+                    min_static_dist = min(min_static_dist, dist);
+                end
+                mtn_h1 = mountain_A_max*exp(-((x-mountain_x)^2+(y-mountain_y)^2)/(2*sigma^2));
+                min_static_dist = min(min_static_dist, z - mtn_h1 - safe_dist);
+                dist_to_line = norm(cross([x,y,z]-start_point, dir_start_end));
+                dist_line_total = dist_line_total + dist_to_line;
+                R_path = R_path + max(0, -min_static_dist);
+            end
+            R_path = R_path / size(path,1);
+            dist_line_avg = dist_line_total / size(path,1);
+            E = 0;
+            for p=2:size(path,1)
+                E = E + abs(path(p,3) - path(p-1,3));
+            end
+            % 优化：起点偏离惩罚
+            dist_final = norm(path(1,:) - start_point);
+            F = wL*L + wR*R_path + wE*E + w_dist_line*dist_line_avg + 0.3*dist_final;
+            ant_paths{ant} = path;
+            ant_F(ant) = F;
+        else
+            ant_paths{ant} = [];
+            ant_F(ant) = inf;
+        end
+    end
+    
+    % 3. 双向路径交汇检测（不变）
+    if iter > 10
+        start_paths = ant_paths(1:ant_num_start);
+        end_paths = ant_paths(ant_num_start+1:ant_num);
+        for s=1:ant_num_start
+            if isempty(start_paths{s}) || size(start_paths{s},1)<3; continue; end
+            for e=1:ant_num_end
+                if isempty(end_paths{e}) || size(end_paths{e},1)<3; continue; end
+                dist_meet = norm(start_paths{s}(end,:) - end_paths{e}(1,:));
+                if dist_meet <= meet_threshold
+                    merged_path = [start_paths{s}; end_paths{e}(2:end,:)];
+                    L = sum(sqrt(sum(diff(merged_path).^2, 2)));
+                    R_path = 0; dist_line_total=0;
+                    for p=1:size(merged_path,1)
+                        x=merged_path(p,1); y=merged_path(p,2); z=merged_path(p,3);
+                        min_static_dist=inf;
+                        for c=1:length(cylinder_position)
+                            cx=cylinder_position{c}(1); cy=cylinder_position{c}(2); cr=cylinder_r;
+                            if c==9; cr=cylinder_r9; elseif c==10; cr=cylinder_r10; end
+                            dist=sqrt((x-cx)^2+(y-cy)^2)-(cr+safe_dist);
+                            min_static_dist=min(min_static_dist, dist);
+                        end
+                        mtn_h1=mountain_A_max*exp(-((x-mountain_x)^2+(y-mountain_y)^2)/(2*sigma^2));
+                        min_static_dist=min(min_static_dist, z-mtn_h1-safe_dist);
+                        R_path = R_path + max(0, -min_static_dist);
+                        dist_line_total = dist_line_total + norm(cross([x,y,z]-start_point, dir_start_end));
+                    end
+                    R_path = R_path/size(merged_path,1);
+                    dist_line_avg = dist_line_total/size(merged_path,1);
+                    E = sum(abs(diff(merged_path(:,3))));
+                    F_merged = wL*L + wR*R_path + wE*E + w_dist_line*dist_line_avg;
+                    if F_merged < global_best_F
+                        global_best_F = F_merged;
+                        global_best_path = merged_path;
+                        fprintf("迭代%d：双向路径交汇，更新全局最优路径，F=%.2f\n", iter, F_merged);
+                    end
+                end
+            end
+        end
+    end
+    
+    % ---------------------- 3.3.3 自适应信息素更新（不变）----------------------
+    for ant=1:ant_num
+        path = ant_paths{ant};
+        if isempty(path) || size(path,1) < 2; continue; end
+        for p=1:size(path,1)
+            [~, i] = min(abs(x_nodes - path(p,1)));
+            [~, j] = min(abs(y_nodes - path(p,2)));
+            [~, k] = min(abs(z_nodes - path(p,3)));
+            delta_tau = K / ant_F(ant);
+            tau_L(i,j,k) = (1 - rho)*tau_L(i,j,k) + rho*delta_tau;
+            tau_R(i,j,k) = (1 - rho)*tau_R(i,j,k) + rho*delta_tau;
+            tau_E(i,j,k) = (1 - rho)*tau_E(i,j,k) + rho*delta_tau;
+        end
+    end
+    tau_total = 0.6*tau_L + 0.25*tau_R + 0.15*tau_E;
+    
+    % ---------------------- 3.3.4 全局更新（不变）----------------------
+    if mod(iter, 10) == 0
+        valid_F = ant_F(ant_F ~= inf);
+        valid_idx = ant_F ~= inf;
+        if ~isempty(valid_F)
+            [min_F, min_idx] = min(valid_F);
+            orig_min_idx = find(valid_idx, min_idx);
+            if min_F < global_best_F
+                global_best_F = min_F;
+                global_best_path = ant_paths{orig_min_idx};
+                fprintf("迭代%d：更新全局最优路径，F=%.2f，路径节点数=%d\n", iter, global_best_F, size(global_best_path,1));
+                
+                if ~isempty(global_best_path) && size(global_best_path,1)>=2
+                    plot3(global_best_path(:,1), global_best_path(:,2), global_best_path(:,3), ...
+                          "r-", "LineWidth", 1, "DisplayName", "原始最优路径");
+                    plot3(start_point(1), start_point(2), start_point(3), "go", "MarkerSize", 8, "MarkerFaceColor", "g");
+                    plot3(end_point(1), end_point(2), end_point(3), "bo", "MarkerSize", 8, "MarkerFaceColor", "b");
+                end
+            end
+        else
+            fprintf("迭代%d：无有效路径，跳过全局更新\n", iter);
+        end
+    end
+    
+    drawnow;
+    pause(0.1);
+end
+%% ===================== 4. 三阶Bezier曲线平滑（优化：终点自然过渡） =====================
+if ~isempty(global_best_path) && size(global_best_path,1)>=4
+    epsilon = 1.2;  
+    simplified_path = douglas_peucker(global_best_path, epsilon);
+    
+    % 优化1：软约束终点，避免硬追加导致转折
+    if norm(simplified_path(end,:) - end_point) > 0.5
+        last_node = simplified_path(end,:);
+        adjust_vec = (end_point - last_node) * 0.6;  % 向终点微调60%，自然过渡
+        simplified_path(end,:) = last_node + adjust_vec;
+        simplified_path = [simplified_path; end_point];  % 终点为最后一个控制点
+    end
+    
+    t = 1:size(simplified_path,1);
+    t_bezier = linspace(1, size(simplified_path,1), smooth_nodes);
+    control_points = simplified_path;
+    
+    % 优化2：调整Bezier控制点，确保终点方向连续
+    if size(control_points,1) >= 3
+        vec_prev = control_points(end-1,:) - control_points(end-2,:);
+        vec_prev = vec_prev / norm(vec_prev + eps);  % 前一段路径方向
+        control_points(end-1,:) = end_point - vec_prev * 5;  % 倒数第二个控制点顺方向后退
+    end
+    
+    if size(control_points,1) < 4
+        control_points = [control_points(1,:); control_points; control_points(end,:)];
+    end
+    x_bezier = bezier_curve(control_points(:,1), t_bezier);
+    y_bezier = bezier_curve(control_points(:,2), t_bezier);
+    z_bezier = bezier_curve(control_points(:,3), t_bezier);
+    smooth_path = [x_bezier', y_bezier', z_bezier'];
+    
+    % 碰撞复检（山地参数已识别）
+    smooth_path = collision_check(smooth_path, obstacle_static, x_nodes, y_nodes, z_nodes, ...
+                                 cylinder_position, cylinder_r, cylinder_r9, cylinder_r10, safe_dist, ...
+                                 mountain_x, mountain_y, mountain_x2, mountain_y2, mountain_A_max, mountain_A_max2, sigma);
+    
+    % 绘制平滑路径（不变）
+    plot3(smooth_path(:,1), smooth_path(:,2), smooth_path(:,3), ...
+          "m-", "LineWidth", 3, "Color", [0.6, 0.2, 0.8], "DisplayName", "中间直穿超平滑路径");
+    line_start_end = [start_point; end_point];
+    plot3(line_start_end(:,1), line_start_end(:,2), line_start_end(:,3), ...
+          "k--", "LineWidth", 1,"Color", [0.1, 0.1, 0.1], "DisplayName", "起点-终点参考直线");
+    legend("Location","best");
+else
+    fprintf("无有效路径生成，请检查障碍布局或参数约束！\n");
+end
+%% ===================== 5. 结果输出（不变） =====================
+fprintf("\n===== 中间直穿超平滑路径规划完成 =====\n");
+if ~isempty(global_best_path)
+    fprintf("全局最优目标函数值F=%.2f\n", global_best_F);
+    fprintf("原始路径节点数：%d\n", size(global_best_path,1));
+    if exist('simplified_path','var')
+        fprintf("简化后路径节点数：%d\n", size(simplified_path,1));
+        fprintf("平滑后路径节点数：%d\n", size(smooth_path,1));
+        fprintf("平滑后路径总长度：%.2f米\n", sum(sqrt(sum(diff(smooth_path).^2, 2))));
+        % 计算平均偏离距离（不变）
+        vec = smooth_path - start_point;
+        dir_rep = repmat(dir_start_end, size(vec,1), 1);
+        cross_vec = cross(vec, dir_rep, 2);
+        dist_to_line = sqrt(sum(cross_vec.^2, 2));
+        avg_dist = mean(dist_to_line);
+        fprintf("平滑后路径平均偏离中间直线距离：%.2f米\n", avg_dist);
+        fprintf("平滑后路径终点与目标终点偏差：%.2f米\n", norm(smooth_path(end,:) - end_point));
+    end
+else
+    fprintf("未生成有效路径，请调整参数（如放宽max_dist_to_line）！\n");
+end
+%% ===================== 地图绘制函数（核心改动2：返回山地参数） =====================
+function [fig_handle, obstacle_static, cylinder_position, cylinder_r, cylinder_r9, cylinder_r10, ...
+         mountain_x, mountain_y, mountain_x2, mountain_y2, mountain_A_max, mountain_A_max2, sigma] = create_environment_map(map_range, grid_step, x_nodes, y_nodes, z_nodes, safe_dist)
+    % 函数功能：绘制3D环境地图（小山+圆柱体障碍），返回所有需用到的参数
+    fig_handle = figure("Position",[100,100,1600,1600]); hold on; grid on; axis square;
+    xlabel("x/米"); ylabel("y/米"); zlabel("高度/米"); title("ACOSRAR无人机三维路径规划（中间直穿+超平滑）");
+    zlim([0,100]); xlim([0,100]);ylim([0,100]);shading interp;
+    view(3); 
+    
+    % 山地参数（需返回给主代码）
+    mountain_x=40; mountain_y=60; mountain_A_max=40;
+    mountain_x2=60; mountain_y2=20; mountain_A_max2=40;
+    sigma=40;
+    % 圆柱体参数（需返回给主代码）
+    cylinder_r=5; cylinder_r9=10; cylinder_r10=7; n_cyl=50;
+    cylinder_position{1}=[20,20,80]; cylinder_position{2}=[60,40,60];
+    cylinder_position{3}=[40,60,80]; cylinder_position{4}=[80,80,70];
+    cylinder_position{5}=[20,80,60]; cylinder_position{6}=[40,80,70];
+    cylinder_position{7}=[80,20,80]; cylinder_position{8}=[80,40,80];
+    cylinder_position{9}=[65,65,80]; cylinder_position{10}=[25,50,75];
+    cylinder_position{11}=[50,20,60];
+    
+    % 绘制小山（不变）
+    [X_mtn, Y_mtn] = meshgrid(x_nodes, y_nodes);
+    noise=0.5*randn(length(x_nodes),length(y_nodes));
+    Z_guass=mountain_A_max*exp(-((X_mtn-mountain_x).^2+(Y_mtn-mountain_y).^2)/(2*sigma*sigma));
+    Z_guass2=mountain_A_max2*exp(-((X_mtn-mountain_x2).^2+(Y_mtn-mountain_y2).^2)/(2*sigma*sigma));
+    Z_mountain=noise+Z_guass; Z_mountain2=noise+Z_guass2;
+    Z_mountain(Z_mountain<0)=0; Z_mountain2(Z_mountain2<0)=0;
+    surf(X_mtn,Y_mtn,Z_mountain,"FaceColor","interp","EdgeColor","none","FaceAlpha",0.9);
+    surf(X_mtn,Y_mtn,Z_mountain2,"FaceColor","interp","EdgeColor","none","FaceAlpha",0.9);
+    
+    % 绘制圆柱体障碍（不变）
+    for i=1:length(cylinder_position)
+        cr = cylinder_r;
+        if i==9; cr=cylinder_r9; elseif i==10; cr=cylinder_r10; end
+        [X_cyl,Y_cyl,Z_cyl]=cylinder(cr,n_cyl);
+        cx = cylinder_position{i}(1)+X_cyl; cy=cylinder_position{i}(2)+Y_cyl;
+        cz = cylinder_position{i}(3)*Z_cyl;
+        surf(cx,cy,cz,"FaceColor",[1,0,0],"EdgeColor","none","FaceAlpha",1.0);
+    end
+    
+    % 标记静态障碍节点（不变）
+    obstacle_static = false(size(x_nodes,1), size(y_nodes,1), size(z_nodes,1));
+    for i=1:length(x_nodes)
+        for j=1:length(y_nodes)
+            for k=1:length(z_nodes)
+                x = x_nodes(i); y = y_nodes(j); z = z_nodes(k);
+                mtn_h1 = mountain_A_max*exp(-((x-mountain_x)^2+(y-mountain_y)^2)/(2*sigma^2));
+                mtn_h2 = mountain_A_max2*exp(-((x-mountain_x2)^2+(y-mountain_y2)^2)/(2*sigma^2));
+                if z < max(mtn_h1, mtn_h2)
+                    obstacle_static(i,j,k) = true;
+                    continue;
+                end
+                for c=1:length(cylinder_position)
+                    cx = cylinder_position{c}(1); cy=cylinder_position{c}(2); cr=cylinder_r;
+                    if c==9; cr=cylinder_r9; elseif c==10; cr=cylinder_r10; end
+                    if sqrt((x-cx)^2+(y-cy)^2) < cr + safe_dist
+                        obstacle_static(i,j,k) = true;
+                        break;
+                    end
+                end
+            end
+        end
+    end
+end
+%% ===================== 原有辅助函数（完全不变） =====================
+function bezier_val = bezier_curve(points, t)
+    n = length(points);
+    m = length(t);
+    bezier_val = zeros(1, m);
+    t_norm = (t - t(1)) / (t(end) - t(1));
+    for i=1:m
+        tn = t_norm(i);
+        val = 0;
+        for k=0:n-1
+            binom = nchoosek(n-1, k);
+            val = val + binom * tn^k * (1-tn)^(n-1-k) * points(k+1);
+        end
+        bezier_val(i) = val;
+    end
+end
+function simplified = douglas_peucker(path, epsilon)
+    if size(path,1) <= 2
+        simplified = path;
+        return;
+    end
+    start = path(1,:);
+    end_idx = size(path,1);
+    end_p = path(end_idx,:);
+    dists = zeros(size(path,1), 1);
+    for i=2:end_idx-1
+        dists(i) = norm(cross(path(i,:)-start, end_p-start))/norm(end_p-start);
+    end
+    [max_dist, max_idx] = max(dists);
+    simplified = [];
+    if max_dist > epsilon
+        left = douglas_peucker(path(1:max_idx,:), epsilon);
+        right = douglas_peucker(path(max_idx:end,:), epsilon);
+        simplified = [left(1:end-1,:); right];
+    else
+        simplified = [start; end_p];
+    end
+end
+function safe_path = collision_check(path, obstacle_static, x_nodes, y_nodes, z_nodes, ...
+                                    cylinder_position, cylinder_r, cylinder_r9, cylinder_r10, safe_dist, ...
+                                    mountain_x, mountain_y, mountain_x2, mountain_y2, mountain_A_max, mountain_A_max2, sigma)
+    safe_path = path;
+    for p=1:size(path,1)
+        x = path(p,1); y = path(p,2); z = path(p,3);
+        % 小山障碍检测
+        mtn_h1 = mountain_A_max*exp(-((x-mountain_x)^2+(y-mountain_y)^2)/(2*sigma^2));
+        mtn_h2 = mountain_A_max2*exp(-((x-mountain_x2)^2+(y-mountain_y2)^2)/(2*sigma^2));
+        if z < max(mtn_h1, mtn_h2) + safe_dist
+            safe_path(p,3) = max(mtn_h1, mtn_h2) + safe_dist + 0.5;
+        end
+        % 圆柱体障碍检测
+        for c=1:length(cylinder_position)
+            cx = cylinder_position{c}(1); cy = cylinder_position{c}(2); cr = cylinder_r;
+            if c==9; cr=cylinder_r9; elseif c==10; cr=cylinder_r10; end
+            if sqrt((x-cx)^2+(y-cy)^2) < cr + safe_dist
+                dir = [x - cx, y - cy, 0];
+                dir = dir / norm(dir + eps);
+                dir_2d = dir(1:2);
+                safe_path(p,1:2) = [cx, cy] + (cr + safe_dist + 0.5)*dir_2d;
+            end
+        end
+    end
+    % 二次平滑
+    t = 1:size(safe_path,1);
+    t_smooth = linspace(1, size(safe_path,1), size(safe_path,1));
+    safe_path(:,1) = spline(t, safe_path(:,1), t_smooth);
+    safe_path(:,2) = spline(t, safe_path(:,2), t_smooth);
+    safe_path(:,3) = spline(t, safe_path(:,3), t_smooth);
+end

@@ -1,0 +1,472 @@
+clear; clc; close all;
+
+%% ====================== 1. 环境参数初始化 ======================
+map_range = [0, 200];
+safe_dist = 2.5;        % 安全距离 (m)
+drone_speed = 20;       % 无人机速度 (m/s)
+
+% 多目标权重（仅用于最终折中解的选择，不参与优化过程）
+weights = [0.4, 0.35, 0.15, 0.15, 0.05];  % [长度, 安全, 能耗, 平滑, 时间]
+
+% 起点终点
+start_pos = [10, 10, 50];
+goal_pos = [190, 190, 80];
+
+% 生成环境（山峰、球形禁飞区、圆柱障碍物）
+[terrain_func, sphere_params, cylinder_params] = generate_environment(map_range);
+
+%% ====================== 2. NMOPOS 参数设置 ======================
+num_ctrl_pts = 12;          % 控制点总数（首尾固定，中间10个可移动）
+num_interp_pts = 150;       % 插值点数量
+
+% NMOPOS 参数
+n_particles = 40;
+max_iter = 150;
+archive_size = 50;
+inertia_w = 0.5;
+c1 = 1.5;
+c2 = 1.5;
+mutate_prob = 0.1;
+mutate_strength = 5.0;
+
+% 优化变量边界：中间控制点的坐标范围
+lb = [0, 0, 10];
+ub = [200, 200, 180];
+dim = (num_ctrl_pts - 2) * 3;
+
+% 初始化粒子位置和速度
+pos = zeros(n_particles, dim);
+vel = zeros(n_particles, dim);
+for i = 1:n_particles
+    t = linspace(0, 1, num_ctrl_pts)';
+    base_x = start_pos(1) + (goal_pos(1)-start_pos(1)) * t;
+    base_y = start_pos(2) + (goal_pos(2)-start_pos(2)) * t;
+    base_z = start_pos(3) + (goal_pos(3)-start_pos(3)) * t;
+    ctrl_pts = [base_x(2:end-1), base_y(2:end-1), base_z(2:end-1)];
+    ctrl_pts = ctrl_pts + randn(size(ctrl_pts)) * 8;
+    ctrl_pts = max(lb, min(ub, ctrl_pts));
+    pos(i, :) = reshape(ctrl_pts, 1, dim);
+    vel(i, :) = randn(1, dim) * 3;
+end
+
+pbest_pos = pos;
+pbest_obj = inf(n_particles, 5);
+archive = struct('pos', [], 'obj', []);
+
+%% ====================== 3. 适应度函数（含惩罚项） ======================
+fitness_func = @(ctrl_vars) evaluate_path_with_penalty(ctrl_vars, start_pos, goal_pos, ...
+    num_ctrl_pts, num_interp_pts, terrain_func, sphere_params, cylinder_params, ...
+    safe_dist, drone_speed);
+
+to_ctrl_pts = @(vars) [start_pos; reshape(vars, [], 3); goal_pos];
+
+%% ====================== 4. NMOPOS 主循环 ======================
+fprintf('正在执行NMOPOS多目标优化（含安全距离惩罚）...\n');
+fitness_history = zeros(max_iter, 1);
+
+for iter = 1:max_iter
+    obj_all = zeros(n_particles, 5);
+    for i = 1:n_particles
+        obj_all(i, :) = fitness_func(pos(i, :));
+    end
+    
+    % 更新个人最优
+    for i = 1:n_particles
+        if any(pbest_obj(i,:) == inf) || dominates(obj_all(i,:), pbest_obj(i,:))
+            pbest_pos(i, :) = pos(i, :);
+            pbest_obj(i, :) = obj_all(i, :);
+        end
+    end
+    
+    % 更新全局存档
+    current_archive = [archive.pos; pos];
+    current_obj = [archive.obj; obj_all];
+    [~, non_dominated] = pareto_filter(current_archive, current_obj);
+    archive.pos = current_archive(non_dominated, :);
+    archive.obj = current_obj(non_dominated, :);
+    
+    if size(archive.pos, 1) > archive_size
+        archive = truncate_archive(archive, archive_size);
+    end
+    
+    % 记录收敛指标
+    if ~isempty(archive.obj)
+        fitness_history(iter) = mean(sum(archive.obj, 2));
+    else
+        fitness_history(iter) = inf;
+    end
+    
+    % 引导者选择与更新
+    if ~isempty(archive.obj)
+        crowding = crowding_distance(archive.obj);
+        if all(isinf(crowding)) || any(isnan(crowding))
+            prob = ones(1, size(archive.obj,1)) / size(archive.obj,1);
+        else
+            crowding(isinf(crowding)) = max(crowding(isfinite(crowding)));
+            prob = crowding / (sum(crowding) + eps);
+        end
+        
+        for i = 1:n_particles
+            idx = roulette_wheel(prob);
+            if isempty(idx) || idx > size(archive.pos,1)
+                idx = randi(size(archive.pos,1));
+            end
+            gbest = archive.pos(idx, :);
+            
+            r1 = rand(1, dim); r2 = rand(1, dim);
+            vel(i, :) = inertia_w * vel(i, :) + ...
+                        c1 * r1 .* (pbest_pos(i, :) - pos(i, :)) + ...
+                        c2 * r2 .* (gbest - pos(i, :));
+            pos(i, :) = pos(i, :) + vel(i, :);
+            
+            % 边界裁剪
+            for d = 1:dim
+                dim_idx = mod(d-1, 3) + 1;
+                lb_val = lb(dim_idx);
+                ub_val = ub(dim_idx);
+                pos(i, d) = max(lb_val, min(ub_val, pos(i, d)));
+            end
+            
+            if rand() < mutate_prob
+                pos(i, :) = pos(i, :) + randn(1, dim) * mutate_strength;
+                for d = 1:dim
+                    dim_idx = mod(d-1, 3) + 1;
+                    lb_val = lb(dim_idx);
+                    ub_val = ub(dim_idx);
+                    pos(i, d) = max(lb_val, min(ub_val, pos(i, d)));
+                end
+            end
+        end
+    end
+    
+    if mod(iter, 20) == 0 || iter == max_iter
+        fprintf('迭代 %d/%d, 存档非支配解数量: %d\n', iter, max_iter, size(archive.pos, 1));
+    end
+end
+
+%% ====================== 5. 从存档中选择最终路径 ======================
+if isempty(archive.obj)
+    error('未找到可行解，请调整算法参数或安全距离阈值');
+end
+weighted_sum = archive.obj * weights(:);
+[~, final_idx] = min(weighted_sum);
+optimal_ctrl_vars = archive.pos(final_idx, :);
+optimal_ctrl_pts = to_ctrl_pts(optimal_ctrl_vars);
+optimal_path = bspline_path(optimal_ctrl_pts, num_interp_pts);
+smooth_path = smooth_path_points(optimal_path, 0.5);
+
+% 强制起点和终点严格等于给定值（双重保险）
+smooth_path(1,:) = start_pos;
+smooth_path(end,:) = goal_pos;
+
+% 可行性验证（使用原始指标，无惩罚）
+[feasible, min_safe] = check_path_feasibility(smooth_path, terrain_func, sphere_params, cylinder_params, safe_dist);
+if feasible
+    fprintf('\n最终路径可行性：可行（最小安全距离：%.2fm ≥ %.2fm）\n', min_safe, safe_dist);
+else
+    fprintf('\n最终路径可行性：不可行（最小安全距离：%.2fm < %.2fm）\n', min_safe, safe_dist);
+end
+
+% 正确获取五项指标
+[path_len, min_safe_val, energy, smoothness, flight_time] = compute_path_metrics(smooth_path, ...
+    terrain_func, sphere_params, cylinder_params, safe_dist, drone_speed);
+
+%% ====================== 6. 输出结果 ======================
+fprintf('\n==================== NMOPOS 多目标优化结果 ====================\n');
+fprintf('路径长度 (m)      : %.2f\n', path_len);
+fprintf('最小安全距离 (m)  : %.2f\n', min_safe_val);
+fprintf('能耗 (Wh)         : %.2f\n', energy);
+fprintf('平滑度 (余弦均值) : %.4f\n', smoothness);
+fprintf('飞行时间 (s)      : %.2f\n', flight_time);
+
+% 绘制收敛曲线
+figure('Name', 'NMOPOS收敛曲线');
+iter_valid = 1:max_iter;
+hist_valid = fitness_history;
+hist_valid(isinf(hist_valid)) = NaN;
+plot(iter_valid, hist_valid, 'b-', 'LineWidth', 1.5);
+xlabel('迭代次数'); ylabel('Pareto前沿平均目标值');
+title('NMOPOS收敛曲线'); grid on;
+
+% 可视化路径和环境（已修改为白色背景+固定坐标轴+可调字体）
+visualize_environment(terrain_func, sphere_params, cylinder_params, map_range);
+visualize_path(smooth_path, start_pos, goal_pos);
+
+%% ========================= 辅助函数定义 =========================
+
+% ---------- 带惩罚的评估函数 ----------
+function obj = evaluate_path_with_penalty(ctrl_vars, start_pos, goal_pos, num_ctrl_pts, num_interp_pts, ...
+    terrain_func, sphere_params, cylinder_params, safe_dist, drone_speed)
+    ctrl_pts = [start_pos; reshape(ctrl_vars, [], 3); goal_pos];
+    path_pts = bspline_path(ctrl_pts, num_interp_pts);
+    [len, min_safe, eng, sm, tm] = compute_path_metrics(path_pts, terrain_func, sphere_params, cylinder_params, safe_dist, drone_speed);
+    
+    % 若最小安全距离小于阈值，施加巨大惩罚（使该解被支配）
+    if min_safe < safe_dist
+        penalty = 1e6;
+        len = len + penalty;
+        eng = eng + penalty;
+        sm = sm - penalty;      % 平滑度惩罚
+        tm = tm + penalty;
+    end
+    obj = [len, min_safe, eng, sm, tm];
+end
+
+% ---------- 原始指标计算（无惩罚） ----------
+function [length_val, min_safe, energy, smoothness, time_val] = compute_path_metrics(path_pts, ...
+    terrain_func, sphere_params, cylinder_params, safe_dist, drone_speed)
+    diffs = diff(path_pts, 1);
+    seg_lengths = sqrt(sum(diffs.^2, 2));
+    length_val = sum(seg_lengths);
+    
+    min_safe = inf;
+    for i = 1:size(path_pts,1)
+        pt = path_pts(i,:);
+        terrain_h = terrain_func(pt(1), pt(2));
+        dist_terrain = pt(3) - terrain_h;
+        dist_sphere = norm(pt - sphere_params.center) - sphere_params.radius;
+        dist_cyl = inf;
+        for j = 1:size(cylinder_params.centers, 1)
+            center = cylinder_params.centers(j, 1:2);
+            h = cylinder_params.centers(j, 3);
+            dx = pt(1) - center(1); dy = pt(2) - center(2);
+            dist_horiz = sqrt(dx^2 + dy^2) - cylinder_params.radius;
+            if pt(3) >= 0 && pt(3) <= h
+                dist_vert = 0;
+            else
+                dist_vert = min(abs(pt(3)-0), abs(pt(3)-h));
+            end
+            dist_cyl = min(dist_cyl, max(dist_horiz, dist_vert));
+        end
+        min_dist = min([dist_terrain, dist_sphere, dist_cyl]);
+        min_safe = min(min_safe, min_dist);
+    end
+    if isinf(min_safe), min_safe = 1e6; end
+    
+    energy = length_val;  % 简化模型
+    n = size(path_pts, 1);
+    cos_angles = zeros(n-2, 1);
+    for i = 2:n-1
+        v1 = path_pts(i,:) - path_pts(i-1,:);
+        v2 = path_pts(i+1,:) - path_pts(i,:);
+        norm_v1 = norm(v1); norm_v2 = norm(v2);
+        if norm_v1>eps && norm_v2>eps
+            cos_angles(i-1) = dot(v1, v2) / (norm_v1 * norm_v2);
+        else
+            cos_angles(i-1) = 1;
+        end
+    end
+    smoothness = mean(cos_angles);
+    time_val = length_val / drone_speed;
+end
+
+% ---------- 环境生成 ----------
+function [terrain_func, sphere_params, cylinder_params] = generate_environment(map_range)
+    peaks = struct('A', {90, 90, 120}, 'x0', {40, 140, 140}, 'y0', {140, 40, 140}, 'sigma', {30, 30, 30});
+    terrain_func = @(x, y) compute_terrain(x, y, peaks);
+    sphere_params.center = [100, 100, 0];
+    sphere_params.radius = 50;
+    cylinder_centers = [40,70,100; 70,40,100; 50,50,100; 90,160,100;
+                        160,80,100; 80,180,100; 100,180,100; 180,60,100; 180,100,100];
+    cylinder_params.centers = cylinder_centers;
+    cylinder_params.radius = 5;
+    cylinder_params.height = 100;
+end
+
+function z = compute_terrain(x, y, peaks)
+    z = zeros(size(x));
+    for i = 1:length(peaks)
+        A = peaks(i).A; x0 = peaks(i).x0; y0 = peaks(i).y0; sigma = peaks(i).sigma;
+        z = z + A * exp(-((x-x0).^2 + (y-y0).^2) / (2*sigma^2));
+    end
+    z(z<0) = 0;
+end
+
+% ---------- 修改后的 B 样条曲线（强制端点） ----------
+function path_pts = bspline_path(ctrl_pts, num_pts)
+    n = size(ctrl_pts, 1);
+    if n < 4
+        t = linspace(0, 1, num_pts)';
+        path_pts = interp1(0:1, ctrl_pts, t, 'linear');
+        return;
+    end
+    t = linspace(0, 1, num_pts);
+    path_pts = zeros(num_pts, 3);
+    for i = 1:num_pts
+        u = t(i);
+        seg = floor(u * (n-3)) + 1;
+        seg = max(1, min(seg, n-3));
+        u_local = (u - (seg-1)/(n-3)) * (n-3);
+        u_local = max(0, min(1, u_local));
+        P0 = ctrl_pts(seg, :); P1 = ctrl_pts(seg+1, :);
+        P2 = ctrl_pts(seg+2, :); P3 = ctrl_pts(seg+3, :);
+        b0 = (1-u_local)^3 / 6; b1 = (3*u_local^3 - 6*u_local^2 + 4) / 6;
+        b2 = (-3*u_local^3 + 3*u_local^2 + 3*u_local + 1) / 6; b3 = u_local^3 / 6;
+        path_pts(i,:) = b0*P0 + b1*P1 + b2*P2 + b3*P3;
+    end
+    % 强制起点和终点与给定的控制点首尾一致
+    path_pts(1,:) = ctrl_pts(1,:);
+    path_pts(end,:) = ctrl_pts(end,:);
+end
+
+% ---------- 修改后的平滑函数（恢复端点） ----------
+function path_smoothed = smooth_path_points(path, alpha)
+    if size(path, 1) < 5
+        path_smoothed = path;
+        return;
+    end
+    path_smoothed = path;
+    for iter = 1:3
+        for i = 2:size(path,1)-1
+            path_smoothed(i,:) = (1-alpha) * path_smoothed(i,:) + ...
+                                 alpha * (path_smoothed(i-1,:) + path_smoothed(i+1,:)) / 2;
+        end
+    end
+    % 恢复起点和终点，防止平滑导致偏移
+    path_smoothed(1,:) = path(1,:);
+    path_smoothed(end,:) = path(end,:);
+end
+
+% ---------- 多目标支配判断 ----------
+function [is_dom] = dominates(obj1, obj2)
+    f1 = obj1; f2 = obj2;
+    f1(2) = -obj1(2); f2(2) = -obj2(2);
+    f1(4) = -obj1(4); f2(4) = -obj2(4);
+    is_dom = all(f1 <= f2) && any(f1 < f2);
+end
+
+% ---------- Pareto 过滤 ----------
+function [idx, nondominated] = pareto_filter(pop, objs)
+    n = size(pop, 1);
+    nondominated = true(n, 1);
+    for i = 1:n
+        for j = 1:n
+            if i ~= j && dominates(objs(j,:), objs(i,:))
+                nondominated(i) = false;
+                break;
+            end
+        end
+    end
+    idx = find(nondominated);
+end
+
+% ---------- 存档裁剪 ----------
+function archive = truncate_archive(archive, max_size)
+    if size(archive.pos, 1) <= max_size, return; end
+    crowd = crowding_distance(archive.obj);
+    [~, idx] = sort(crowd, 'descend');
+    keep_idx = idx(1:max_size);
+    archive.pos = archive.pos(keep_idx, :);
+    archive.obj = archive.obj(keep_idx, :);
+end
+
+% ---------- 拥挤距离 ----------
+function crowd = crowding_distance(objs)
+    n = size(objs, 1);
+    if n <= 2, crowd = ones(n, 1); return; end
+    m = size(objs, 2);
+    crowd = zeros(n, 1);
+    for i = 1:m
+        [sorted, idx] = sort(objs(:, i));
+        crowd(idx(1)) = inf; crowd(idx(end)) = inf;
+        for j = 2:n-1
+            crowd(idx(j)) = crowd(idx(j)) + (sorted(j+1) - sorted(j-1));
+        end
+    end
+end
+
+% ---------- 轮盘赌选择 ----------
+function idx = roulette_wheel(prob)
+    cum_prob = cumsum(prob);
+    r = rand();
+    idx = find(cum_prob >= r, 1);
+    if isempty(idx), idx = randi(length(prob)); end
+end
+
+% ---------- 路径可行性检查 ----------
+function [feasible, min_dist] = check_path_feasibility(path_pts, terrain_func, sphere_params, cylinder_params, safe_dist)
+    min_dist = inf;
+    for i = 1:size(path_pts,1)
+        pt = path_pts(i,:);
+        terrain_h = terrain_func(pt(1), pt(2));
+        dist_terrain = pt(3) - terrain_h;
+        dist_sphere = norm(pt - sphere_params.center) - sphere_params.radius;
+        dist_cyl = inf;
+        for j = 1:size(cylinder_params.centers, 1)
+            center = cylinder_params.centers(j, 1:2);
+            h = cylinder_params.centers(j, 3);
+            dx = pt(1) - center(1); dy = pt(2) - center(2);
+            dist_horiz = sqrt(dx^2 + dy^2) - cylinder_params.radius;
+            if pt(3) >= 0 && pt(3) <= h
+                dist_vert = 0;
+            else
+                dist_vert = min(abs(pt(3)-0), abs(pt(3)-h));
+            end
+            dist_cyl = min(dist_cyl, max(dist_horiz, dist_vert));
+        end
+        min_dist = min([min_dist, dist_terrain, dist_sphere, dist_cyl]);
+    end
+    feasible = (min_dist >= safe_dist);
+end
+
+% ---------- 可视化环境（修改：白色背景+固定坐标轴+可调字体） ----------
+function visualize_environment(terrain_func, sphere_params, cylinder_params, map_range)
+    % ========== 字体大小参数（用户可自由调节，参考 map.m） ==========
+    tick_font_size  = 20;   % 坐标轴刻度数字（0/50/100/150/200）的字号
+    label_font_size = 20;   % 坐标轴名称（X/m、Y/m、Z/m）的字号
+    title_font_size = 16;   % 图标题的字号（本图未设标题，保留备用）
+    % =============================================================
+    
+    figure('Name', '环境与规划路径', 'Position', [100,100,800,600], 'Color', 'white'); % 外部背景白色
+    title("NMOPOS全局路径规划","FontSize",16);
+    hold on; grid on; axis equal;
+    
+    % 固定坐标轴范围 0~200，禁止自动缩放
+    xlim([0,200]); ylim([0,200]); zlim([0,200]);
+    axis manual;
+    
+    % 坐标轴标签及字体大小
+    xlabel('X (m)', 'FontSize', label_font_size);
+    ylabel('Y (m)', 'FontSize', label_font_size);
+    zlabel('Z (m)', 'FontSize', label_font_size);
+    
+    % 设置坐标系内部背景白色，刻度数字字体大小
+    set(gca, 'Color', 'white', 'FontSize', tick_font_size);
+    
+    % 地形曲面（渐变颜色）
+    [Xg, Yg] = meshgrid(linspace(map_range(1), map_range(2), 80));
+    Zg = terrain_func(Xg, Yg);
+    surf(Xg, Yg, Zg, 'FaceColor', 'interp', 'EdgeColor', 'none', 'FaceAlpha', 0.9);
+    % colormap(jet);
+    
+    % 球形禁飞区（紫色，不透明）
+    [sx, sy, sz] = sphere(40);
+    sx = sx * sphere_params.radius + sphere_params.center(1);
+    sy = sy * sphere_params.radius + sphere_params.center(2);
+    sz = sz * sphere_params.radius + sphere_params.center(3);
+    sz(sz < 0) = 0;
+    surf(sx, sy, sz, 'FaceColor', [1,0,1], 'EdgeColor', 'none', 'FaceAlpha', 1.0);
+    
+    % 圆柱障碍物（黄色，不透明，带顶盖）
+    [cx, cy, cz] = cylinder(cylinder_params.radius, 40);
+    for i = 1:size(cylinder_params.centers, 1)
+        x0 = cylinder_params.centers(i,1);
+        y0 = cylinder_params.centers(i,2);
+        h = cylinder_params.centers(i,3);
+        surf(x0 + cx, y0 + cy, cz * h, 'FaceColor', [1,1,0], 'EdgeColor', 'none', 'FaceAlpha', 1.0);
+        theta = linspace(0, 2*pi, 40);
+        top_x = x0 + cylinder_params.radius * cos(theta);
+        top_y = y0 + cylinder_params.radius * sin(theta);
+        top_z = repmat(h, size(top_x));
+        fill3(top_x, top_y, top_z, [1,1,0], 'EdgeColor', 'none', 'FaceAlpha', 1.0);
+    end
+    view(3);
+end
+
+% ---------- 可视化路径（终点改为蓝色球） ----------
+function visualize_path(path_pts, start_pos, goal_pos)
+    plot3(path_pts(:,1), path_pts(:,2), path_pts(:,3), 'r-', 'LineWidth', 2);
+    plot3(start_pos(1), start_pos(2), start_pos(3), 'go', 'MarkerSize', 10, 'MarkerFaceColor', 'g');
+    plot3(goal_pos(1), goal_pos(2), goal_pos(3), 'bo', 'MarkerSize', 10, 'MarkerFaceColor', 'b');  % 终点蓝色实心圆
+    legend('地形', '禁飞区', '圆柱', '规划路径', '起点', '终点');
+end

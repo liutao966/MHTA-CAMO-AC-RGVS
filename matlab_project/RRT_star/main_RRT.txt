@@ -1,0 +1,396 @@
+%% ===================== 1. 地图生成（与您提供的map.txt完全一致，修正bug+固定随机种子）=====================
+clear;
+clc;
+close all;
+rng(0); % 固定随机种子，保证山体噪声固定，地图可复现
+
+% 初始化三维坐标系
+map_x=0:0.1:200;
+map_y=0:0.1:200;
+map_z=0:0.1:200;
+% 生成二维网格矩阵
+[X,Y]=meshgrid(map_x,map_y);
+
+% --------------------- 山体障碍物生成 ---------------------
+% 1号山
+mountain_A_max=90;
+mountain_x=40;
+mountain_y=140;
+sigma=30;
+z_guass=mountain_A_max*exp(-((X-mountain_x).^2+(Y-mountain_y).^2)/(2*sigma*sigma));
+noise=randn(size(X)); % 全局统一噪声
+z_mountain=noise+z_guass;
+z_mountain(z_mountain<0)=0;
+
+% 2号山
+mountain_x2=140;
+mountain_y2=40;
+mountain_A_max2=90;
+sigma2=30;
+z_guass2=mountain_A_max2*exp(-((X-mountain_x2).^2+(Y-mountain_y2).^2)/(2*sigma2*sigma2));
+z_mountain2=noise+z_guass2;
+z_mountain2(z_mountain2<0)=0;
+
+% 3号山（修正原代码bug：原代码对z_guass3做了截断，应该对z_mountain3截断）
+mountain_x3=140;
+mountain_y3=140;
+sigma3=30;
+mountain_A3=120;
+z_guass3=mountain_A3*exp(-((X-mountain_x3).^2+(Y-mountain_y3).^2)/(2*sigma3*sigma3));
+z_mountain3=z_guass3+noise;
+z_mountain3(z_mountain3<0)=0; % 修正后的截断
+
+% 预计算全局山体高度矩阵（任意(x,y)处的最大山体高度，用于碰撞检测）
+z_total_mountain = max(cat(3,z_mountain,z_mountain2,z_mountain3),[],3);
+
+% --------------------- 禁飞区与圆柱体障碍物参数（预存用于碰撞检测）---------------------
+% 半球禁飞区参数
+no_fly_r = 50;
+no_fly_cx = 100;
+no_fly_cy = 100;
+no_fly_cz = 0;
+
+% 圆柱体障碍物参数
+cylinder_r = 5;
+cylinder_position = {
+    [40,70,100]; [70,40,100]; [50,50,100];
+    [90,160,100]; [160,80,100]; [80,180,100];
+    [100,180,100]; [180,60,100]; [180,100,100]
+};
+cylinder_num = length(cylinder_position);
+
+%% ===================== 2. 核心参数定义（对应main.txt参数，可按需修改）=====================
+% 无人机飞行参数
+params.v = 10;               % 飞行速度 m/s（匀速巡航假设）
+params.safe_dist = 2.5;        % 安全距离 m（与障碍物的最小允许距离）
+params.max_height = 200;     % 最大飞行高度 m（与地图范围一致）
+params.min_height = 5;       % 最低飞行高度 m
+
+% RRT*算法参数
+params.max_iter = 5000;      % 最大迭代次数
+params.step_size = 5;        % 扩展步长 m
+params.goal_threshold = 5;   % 目标点到达阈值 m
+params.rewire_radius = 15;   % 重布线邻域半径 m
+params.goal_sample_rate = 0.1; % 目标点采样概率（10%概率直接采样终点，加速收敛）
+
+% 地图边界
+params.x_range = [0, 200];
+params.y_range = [0, 200];
+params.z_range = [params.min_height, params.max_height];
+
+% 能耗计算参数（无人机通用能耗模型，单位：Wh/m）
+params.energy_base = 1.2;    % 平飞基础能耗系数
+params.energy_climb = 2.5;   % 爬升附加能耗系数
+params.energy_descend = 0.8; % 下降附加能耗系数
+
+% 起点与终点定义（无碰撞安全位置，可按需修改）
+start_point = [10, 10, 20];  % 起点 [x,y,z]
+goal_point = [190, 190, 150];% 终点 [x,y,z]
+
+%% ===================== 3. 碰撞检测与距离计算核心函数 =====================
+% 检测点是否与障碍物碰撞（含安全距离）
+function is_collision = check_collision(point, params, X, Y, z_total_mountain, no_fly_cx, no_fly_cy, no_fly_cz, no_fly_r, cylinder_r, cylinder_position, cylinder_num)
+    x = point(1); y = point(2); z = point(3);
+    is_collision = true;
+    
+    % 1. 检测是否超出地图边界
+    if x < params.x_range(1) || x > params.x_range(2) ...
+        || y < params.y_range(1) || y > params.y_range(2) ...
+        || z < params.z_range(1) || z > params.z_range(2)
+        return;
+    end
+    
+    % 2. 检测山体碰撞（含安全距离）
+    mountain_h = interp2(X, Y, z_total_mountain, x, y, 'linear', 0);
+    if z < mountain_h + params.safe_dist
+        return;
+    end
+    
+    % 3. 检测半球禁飞区碰撞（含安全距离）
+    dist_to_nofly = sqrt((x - no_fly_cx)^2 + (y - no_fly_cy)^2 + (z - no_fly_cz)^2);
+    if dist_to_nofly < no_fly_r + params.safe_dist && z >= no_fly_cz
+        return;
+    end
+    
+    % 4. 检测圆柱体障碍物碰撞（含安全距离）
+    for i = 1:cylinder_num
+        cx = cylinder_position{i}(1);
+        cy = cylinder_position{i}(2);
+        cz_max = cylinder_position{i}(3);
+        % 水平距离检测
+        dist_xy = sqrt((x - cx)^2 + (y - cy)^2);
+        % 高度范围检测
+        if dist_xy < cylinder_r + params.safe_dist && z <= cz_max + params.safe_dist && z >= 0
+            return;
+        end
+    end
+    
+    % 所有检测通过，无碰撞
+    is_collision = false;
+end
+
+% 检测两点之间的路径段是否碰撞
+function is_segment_collision = check_segment_collision(p1, p2, params, X, Y, z_total_mountain, no_fly_cx, no_fly_cy, no_fly_cz, no_fly_r, cylinder_r, cylinder_position, cylinder_num)
+    is_segment_collision = true;
+    % 计算路径段长度与插值点数
+    seg_length = norm(p2 - p1);
+    interp_num = max(ceil(seg_length / 0.5), 2); % 每0.5m一个插值点，保证检测精度
+    % 线性插值
+    interp_x = linspace(p1(1), p2(1), interp_num);
+    interp_y = linspace(p1(2), p2(2), interp_num);
+    interp_z = linspace(p1(3), p2(3), interp_num);
+    % 逐个检测插值点
+    for i = 1:interp_num
+        point = [interp_x(i), interp_y(i), interp_z(i)];
+        if check_collision(point, params, X, Y, z_total_mountain, no_fly_cx, no_fly_cy, no_fly_cz, no_fly_r, cylinder_r, cylinder_position, cylinder_num)
+            return;
+        end
+    end
+    % 路径段无碰撞
+    is_segment_collision = false;
+end
+
+% 计算点到最近障碍物的距离（用于安全距离指标计算）
+function min_dist = calc_min_obstacle_dist(point, X, Y, z_total_mountain, no_fly_cx, no_fly_cy, no_fly_cz, no_fly_r, cylinder_r, cylinder_position, cylinder_num)
+    x = point(1); y = point(2); z = point(3);
+    dist_list = [];
+    
+    % 1. 到山体的距离
+    mountain_h = interp2(X, Y, z_total_mountain, x, y, 'linear', 0);
+    dist_mountain = z - mountain_h;
+    dist_list = [dist_list, dist_mountain];
+    
+    % 2. 到禁飞区的距离
+    dist_to_nofly = sqrt((x - no_fly_cx)^2 + (y - no_fly_cy)^2 + (z - no_fly_cz)^2);
+    dist_nofly = dist_to_nofly - no_fly_r;
+    dist_list = [dist_list, dist_nofly];
+    
+    % 3. 到圆柱体的距离
+    for i = 1:cylinder_num
+        cx = cylinder_position{i}(1);
+        cy = cylinder_position{i}(2);
+        cz_max = cylinder_position{i}(3);
+        dist_xy = sqrt((x - cx)^2 + (y - cy)^2);
+        dist_cyl_xy = dist_xy - cylinder_r;
+        % 高度方向距离
+        if z > cz_max
+            dist_cyl_z = z - cz_max;
+        else
+            dist_cyl_z = 0;
+        end
+        dist_cyl = sqrt(dist_cyl_xy^2 + dist_cyl_z^2);
+        dist_list = [dist_list, dist_cyl];
+    end
+    
+    % 最小距离
+    min_dist = min(dist_list);
+end
+
+%% ===================== 4. RRT*算法主体 =====================
+% 初始化RRT*树
+tree.node = start_point;   % 节点坐标
+tree.parent = 0;           % 父节点索引
+tree.cost = 0;             % 从起点到该节点的累计代价
+node_count = 1;
+goal_reached = false;
+goal_node_idx = -1;
+
+fprintf('RRT*算法开始迭代，最大迭代次数：%d\n', params.max_iter);
+for iter = 1:params.max_iter
+    % --------------------- 步骤1：随机采样 ---------------------
+    if rand() < params.goal_sample_rate
+        % 以设定概率采样目标点
+        sample_point = goal_point;
+    else
+        % 随机采样地图内的点
+        sample_point = [
+            params.x_range(1) + rand()*(params.x_range(2)-params.x_range(1)), ...
+            params.y_range(1) + rand()*(params.y_range(2)-params.y_range(1)), ...
+            params.z_range(1) + rand()*(params.z_range(2)-params.z_range(1))
+        ];
+    end
+    
+    % --------------------- 步骤2：找到树中最近的节点 ---------------------
+    node_array = reshape([tree.node], 3, [])';
+    dist_array = vecnorm(node_array - sample_point, 2, 2);
+    [~, nearest_idx] = min(dist_array);
+    nearest_node = tree(nearest_idx).node;
+    
+    % --------------------- 步骤3：扩展新节点 ---------------------
+    direction = sample_point - nearest_node;
+    direction = direction / norm(direction); % 单位化方向向量
+    new_node = nearest_node + direction * params.step_size;
+    
+    % --------------------- 步骤4：新节点与路径段碰撞检测 ---------------------
+    if check_segment_collision(nearest_node, new_node, params, X, Y, z_total_mountain, no_fly_cx, no_fly_cy, no_fly_cz, no_fly_r, cylinder_r, cylinder_position, cylinder_num)
+        continue; % 碰撞，跳过本次迭代
+    end
+    
+    % --------------------- 步骤5：选择最优父节点 ---------------------
+    % 找到邻域内的所有节点
+    new_node_array = reshape([tree.node], 3, [])';
+    dist_to_new = vecnorm(new_node_array - new_node, 2, 2);
+    neighbor_idx = find(dist_to_new <= params.rewire_radius);
+    
+    % 计算邻域内所有节点到新节点的代价，选择最小代价父节点
+    min_cost = tree(nearest_idx).cost + norm(new_node - nearest_node);
+    best_parent_idx = nearest_idx;
+    
+    for i = 1:length(neighbor_idx)
+        idx = neighbor_idx(i);
+        temp_cost = tree(idx).cost + norm(new_node - tree(idx).node);
+        % 代价更小且路径无碰撞
+        if temp_cost < min_cost && ~check_segment_collision(tree(idx).node, new_node, params, X, Y, z_total_mountain, no_fly_cx, no_fly_cy, no_fly_cz, no_fly_r, cylinder_r, cylinder_position, cylinder_num)
+            min_cost = temp_cost;
+            best_parent_idx = idx;
+        end
+    end
+    
+    % --------------------- 步骤6：将新节点加入树中 ---------------------
+    node_count = node_count + 1;
+    tree(node_count).node = new_node;
+    tree(node_count).parent = best_parent_idx;
+    tree(node_count).cost = min_cost;
+    
+    % --------------------- 步骤7：重布线邻域节点 ---------------------
+    for i = 1:length(neighbor_idx)
+        idx = neighbor_idx(i);
+        temp_cost = tree(node_count).cost + norm(tree(idx).node - new_node);
+        % 新路径代价更小且无碰撞
+        if temp_cost < tree(idx).cost && ~check_segment_collision(new_node, tree(idx).node, params, X, Y, z_total_mountain, no_fly_cx, no_fly_cy, no_fly_cz, no_fly_r, cylinder_r, cylinder_position, cylinder_num)
+            tree(idx).parent = node_count;
+            tree(idx).cost = temp_cost;
+        end
+    end
+    
+    % --------------------- 步骤8：检查是否到达终点 ---------------------
+    if norm(new_node - goal_point) <= params.goal_threshold
+        % 终点到新节点的路径无碰撞
+        if ~check_segment_collision(new_node, goal_point, params, X, Y, z_total_mountain, no_fly_cx, no_fly_cy, no_fly_cz, no_fly_r, cylinder_r, cylinder_position, cylinder_num)
+            goal_reached = true;
+            % 将终点加入树中
+            node_count = node_count + 1;
+            tree(node_count).node = goal_point;
+            tree(node_count).parent = node_count - 1;
+            tree(node_count).cost = tree(node_count - 1).cost + norm(goal_point - new_node);
+            goal_node_idx = node_count;
+            fprintf('迭代第%d次，已找到到达终点的路径！\n', iter);
+            break; % 找到路径后可提前退出，也可继续迭代优化
+        end
+    end
+    
+    % 迭代进度提示
+    if mod(iter, 500) == 0
+        fprintf('已完成%d次迭代，当前树节点数：%d\n', iter, node_count);
+    end
+end
+
+% 检查是否找到路径
+if ~goal_reached
+    fprintf('达到最大迭代次数，未找到到达终点的有效路径！\n');
+    return;
+end
+
+%% ===================== 5. 路径回溯 =====================
+fprintf('开始回溯最优路径...\n');
+path = [];
+current_idx = goal_node_idx;
+while current_idx ~= 0
+    path = [tree(current_idx).node; path];
+    current_idx = tree(current_idx).parent;
+end
+path_num = size(path, 1);
+fprintf('路径回溯完成，路径点数量：%d\n', path_num);
+
+%% ===================== 6. 多目标指标计算 =====================
+fprintf('===================== 多目标指标计算结果 =====================\n');
+
+% 1. 路径总长度
+path_seg_length = vecnorm(diff(path, 1, 1), 2, 2);
+total_length = sum(path_seg_length);
+fprintf('1. 路径总长度：%.2f m\n', total_length);
+
+% 2. 飞行时间（匀速假设）
+flight_time = total_length / params.v;
+fprintf('2. 总飞行时间：%.2f s\n', flight_time);
+
+% 3. 总能耗
+delta_z = diff(path(:,3), 1, 1);
+total_climb = sum(delta_z(delta_z > 0)); % 总爬升高度
+total_descend = sum(abs(delta_z(delta_z < 0))); % 总下降高度
+total_energy = params.energy_base * total_length + params.energy_climb * total_climb + params.energy_descend * total_descend;
+fprintf('3. 总飞行能耗：%.2f Wh\n', total_energy);
+
+% 4. 路径平滑度（相邻路径段方向夹角总和，值越小越平滑）
+smoothness = 0;
+for i = 2:path_num-1
+    vec1 = path(i,:) - path(i-1,:);
+    vec2 = path(i+1,:) - path(i,:);
+    % 单位化
+    vec1 = vec1 / norm(vec1);
+    vec2 = vec2 / norm(vec2);
+    % 计算夹角（弧度）
+    cos_theta = dot(vec1, vec2);
+    cos_theta = max(min(cos_theta, 1), -1); % 数值截断，避免超出范围
+    theta = acos(cos_theta);
+    smoothness = smoothness + theta;
+end
+fprintf('4. 路径平滑度（夹角总和）：%.2f rad\n', smoothness);
+
+% 5. 安全距离指标
+min_dist_list = zeros(path_num, 1);
+for i = 1:path_num
+    min_dist_list(i) = calc_min_obstacle_dist(path(i,:), X, Y, z_total_mountain, no_fly_cx, no_fly_cy, no_fly_cz, no_fly_r, cylinder_r, cylinder_position, cylinder_num);
+end
+avg_safe_dist = mean(min_dist_list);
+min_safe_dist = min(min_dist_list);
+fprintf('5. 路径平均安全距离：%.2f m\n', avg_safe_dist);
+fprintf('   路径最小安全距离：%.2f m\n', min_safe_dist);
+fprintf('===============================================================\n');
+
+%% ===================== 7. 地图与路径可视化 =====================
+% 绘制原地图
+figure("Position",[100,100,1000,800]);
+hold on; grid on; axis equal; view(3);
+
+% 绘制三座山体
+surf(X,Y,z_mountain,"FaceColor","interp","EdgeColor","none","FaceAlpha",0.9);
+surf(X,Y,z_mountain2,"FaceColor","interp","EdgeColor","none","FaceAlpha",0.9);
+surf(X,Y,z_mountain3,"FaceColor","interp","EdgeColor","none","FaceAlpha",0.9);
+
+% 绘制半球禁飞区
+n_ball=50;
+[X_ball,Y_ball,Z_ball]=sphere(n_ball);
+ball_x1=no_fly_cx+X_ball*no_fly_r;
+ball_y1=no_fly_cy+Y_ball*no_fly_r;
+ball_z1=no_fly_cz+Z_ball*no_fly_r;
+ball_z1(ball_z1<0)=0;
+surf(ball_x1,ball_y1,ball_z1,"FaceColor",[1,0,1],"EdgeColor","none","FaceAlpha",0.8);
+
+% 绘制圆柱体障碍物
+n_cylinder=50;
+[X_cylinder,Y_cylinder,Z_cylinder]=cylinder(cylinder_r,n_cylinder);
+for i=1:cylinder_num
+    cylinder_x=cylinder_position{i}(1)+X_cylinder;
+    cylinder_y=cylinder_position{i}(2)+Y_cylinder;
+    cylinder_z=cylinder_position{i}(3)*Z_cylinder;
+    surf(cylinder_x,cylinder_y,cylinder_z,"FaceColor",[1,1,0],"EdgeColor","none","FaceAlpha",0.9);
+end
+
+% 绘制RRT*最优路径
+plot3(path(:,1), path(:,2), path(:,3), 'r-', 'LineWidth', 3, 'DisplayName', '最优路径');
+% 绘制起点和终点
+scatter3(start_point(1), start_point(2), start_point(3), 200, 'g', 'filled', 'DisplayName', '起点');
+scatter3(goal_point(1), goal_point(2), goal_point(3), 200, 'b', 'filled', 'DisplayName', '终点');
+
+% 图形设置
+xlabel("X/m");
+ylabel("Y/m");
+zlabel("Z/m");
+xlim([0,200]);
+ylim([0,200]);
+zlim([0,200]);
+title("3D地图RRT*全局路径规划结果");
+shading interp;
+legend;
+hold off;
