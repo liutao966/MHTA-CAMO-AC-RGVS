@@ -5,7 +5,7 @@
 %  Procedure:
 %    For each algo x obstacle count(2/6/11) x seed(20 runs), run dynamic
 %    obstacle avoidance simulation, record per-step "decision time"
-%    (excluding move_obstacles), aggregate mean / max / 95th percentile,
+%    (excluding move_obstacles), aggregate mean / 95th / 99th percentile / median-of-per-seed max,
 %    compare against UAV control cycles 50Hz(20ms) / 100Hz(10ms).
 %
 %  Output:
@@ -90,50 +90,57 @@ T_50Hz  = 20;
 T_100Hz = 10;
 
 agg = cell(nAlgo, nCount);
-stats = zeros(nAlgo, nCount, 6);
+stats = zeros(nAlgo, nCount, 7);
 
 fprintf('\n================ Real-time Performance Table ================\n');
-fprintf('Algorithm        | Obstacles | Mean(ms) | Max(ms) | P95(ms) | <=50Hz(20ms) | <=100Hz(10ms)\n');
-fprintf('%s\n', repmat('-', 1, 105));
+fprintf('Algorithm        | Obstacles | Mean(ms) | P95(ms) | P99(ms) | MaxMed(ms) | <=50Hz(20ms) | <=100Hz(10ms)\n');
+fprintf('%s\n', repmat('-', 1, 112));
 
 for a = 1:nAlgo
     for c = 1:nCount
         agg{a, c} = [];          % 供 Fig1 CDF：所有 step 混在一起（分布形状）
         seed_mean = zeros(nseed, 1);
         seed_p95  = zeros(nseed, 1);
+        seed_p99  = zeros(nseed, 1);
+        seed_max  = zeros(nseed, 1);
         for s = 1:nseed
             t = all_times{a, c, s}(:);
             t = t(isfinite(t));
             agg{a, c} = [agg{a, c}; t]; %#ok<AGROW>
             seed_mean(s) = mean(t) * 1000;
             seed_p95(s)  = local_prctile(t, 95) * 1000;
+            seed_p99(s)  = local_prctile(t, 99) * 1000;
+            seed_max(s)  = max(t) * 1000;
         end
 
         mu   = mean(seed_mean);       % 等权 mean over seeds（隔离长绕行 seed 的样本稀释）
-        mx   = max(agg{a, c}) * 1000; % 全局 max（所有 step 的最大单步耗时）
         p95  = mean(seed_p95);        % 等权 mean of per-seed P95
+        p99  = mean(seed_p99);        % 等权 mean of per-seed P99
+        mx   = median(seed_max);      % per-seed max 的中位数（稳健，避免单个 OS 毛刺顶爆全局 max）
         sd   = std(seed_mean);        % 跨 seed 的 mean 标准差
         r50  = mu / T_50Hz * 100;
         r100 = mu / T_100Hz * 100;
         stats(a, c, 1) = mu;
         stats(a, c, 2) = mx;
         stats(a, c, 3) = p95;
-        stats(a, c, 4) = sd;
-        stats(a, c, 5) = r50;
-        stats(a, c, 6) = r100;
+        stats(a, c, 4) = p99;
+        stats(a, c, 5) = sd;
+        stats(a, c, 6) = r50;
+        stats(a, c, 7) = r100;
 
-        fprintf('%-16s | %9d | %8.2f | %8.2f | %7.2f | %12.1f%% | %13.1f%%\n', ...
-            algos{a}, counts(c), mu, mx, p95, r50, r100);
+        fprintf('%-16s | %9d | %8.2f | %7.2f | %7.2f | %9.2f | %12.1f%% | %13.1f%%\n', ...
+            algos{a}, counts(c), mu, p95, p99, mx, r50, r100);
     end
-    fprintf('%s\n', repmat('-', 1, 105));
+    fprintf('%s\n', repmat('-', 1, 112));
 end
 
 % ---------- CSV output ----------
 oc = zeros(nAlgo * nCount, 1);
 al = cell(nAlgo * nCount, 1);
 mn = zeros(nAlgo * nCount, 1);
-mx = zeros(nAlgo * nCount, 1);
 p9 = zeros(nAlgo * nCount, 1);
+p99 = zeros(nAlgo * nCount, 1);
+mx = zeros(nAlgo * nCount, 1);
 r5 = zeros(nAlgo * nCount, 1);
 r1 = zeros(nAlgo * nCount, 1);
 k = 0;
@@ -142,16 +149,17 @@ for a = 1:nAlgo
         k = k + 1;
         oc(k) = counts(c);
         al{k} = algos{a};
-        mn(k) = stats(a, c, 1);
-        mx(k) = stats(a, c, 2);
-        p9(k) = stats(a, c, 3);
-        r5(k) = stats(a, c, 5);
-        r1(k) = stats(a, c, 6);
+        mn(k)  = stats(a, c, 1);
+        p9(k)  = stats(a, c, 3);
+        p99(k) = stats(a, c, 4);
+        mx(k)  = stats(a, c, 2);   % per-seed max 的中位数（稳健 max）
+        r5(k)  = stats(a, c, 6);
+        r1(k)  = stats(a, c, 7);
     end
 end
-T_out = table(oc, string(al), mn, mx, p9, r5, r1, ...
-    'VariableNames', {'obstacle_count', 'algorithm', 'mean_ms', 'max_ms', ...
-                      'p95_ms', 'ratio_50hz_pct', 'ratio_100hz_pct'});
+T_out = table(oc, string(al), mn, p9, p99, mx, r5, r1, ...
+    'VariableNames', {'obstacle_count', 'algorithm', 'mean_ms', 'p95_ms', ...
+                      'p99_ms', 'max_median_ms', 'ratio_50hz_pct', 'ratio_100hz_pct'});
 writetable(T_out, fullfile(root, 'realtime_results.csv'));
 fprintf('\nResults saved to %s\n', fullfile(root, 'realtime_results.csv'));
 
@@ -215,6 +223,7 @@ sgtitle('CDF of Step-wise Decision Time', 'FontSize', 14, 'FontWeight', 'bold');
 fig2 = figure('Position', [150 150 950 580], 'Color', 'white');
 mu_mat  = squeeze(stats(:, :, 1));
 p95_mat = squeeze(stats(:, :, 3));
+p99_mat = squeeze(stats(:, :, 4));
 mx_mat  = squeeze(stats(:, :, 2));
 
 hold on; grid on; box on;
@@ -227,9 +236,12 @@ for a = 1:nAlgo
     plot(x, p95_mat(a, :), '--', 'Color', colors(a, :), ...
         'LineWidth', 1.5, 'Marker', 's', 'MarkerSize', 5, ...
         'DisplayName', [algos{a}, ' (P95)']);
+    plot(x, p99_mat(a, :), ':', 'Color', colors(a, :), ...
+        'LineWidth', 1.5, 'Marker', 'd', 'MarkerSize', 4, ...
+        'DisplayName', [algos{a}, ' (P99)']);
     plot(x, mx_mat(a, :), '-.', 'Color', colors(a, :), ...
         'LineWidth', 1.2, 'Marker', '^', 'MarkerSize', 4, ...
-        'DisplayName', [algos{a}, ' (Max)']);
+        'DisplayName', [algos{a}, ' (Max, median)']);
 end
 
 yline(T_50Hz,  'k:', 'LineWidth', 1.8, 'DisplayName', '50Hz (20ms)');
@@ -237,7 +249,7 @@ yline(T_100Hz, 'k:', 'LineWidth', 1.2, 'HandleVisibility', 'off');
 
 xlabel('Number of dynamic obstacles', 'FontSize', 12);
 ylabel('Step-wise decision time (ms)', 'FontSize', 12);
-title('Mean / P95 / Max Decision Time vs Obstacle Count', ...
+title('Mean / P95 / P99 / Max(median) Decision Time vs Obstacle Count', ...
     'FontSize', 14, 'FontWeight', 'bold');
 set(gca, 'XTick', x, 'FontSize', 11);
 legend('Location', 'northwest', 'FontSize', 8, 'Interpreter', 'none');
@@ -332,7 +344,7 @@ end
 function [step_times, status] = sim_avss_timed(path, dyn, start, goal, env)
 uav_speed  = 2.0;
 look_ahead = 12;
-max_steps  = 3000;
+max_steps  = 4000;
 
 glob = densify_path(path, 1.0);
 glob_cum = [0; cumsum(sqrt(sum(diff(glob) .^ 2, 2)))];

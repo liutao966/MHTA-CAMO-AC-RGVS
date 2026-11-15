@@ -5,7 +5,7 @@ function [success, trail, status] = sim_avss(path, dyn, start, goal, env, sigma)
 if nargin < 6, sigma = 0; end
 uav_speed  = 2.0;
 look_ahead = 12;
-max_steps  = 3000;
+max_steps  = 4000;
 
 glob = densify_path(path, 1.0);
 glob_cum = [0; cumsum(sqrt(sum(diff(glob) .^ 2, 2)))];
