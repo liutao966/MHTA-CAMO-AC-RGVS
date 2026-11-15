@@ -32,7 +32,8 @@ MHTA-CAMO-AC-RGVS/
     ├── run_type_grouping.m             # 障碍类型分组实验（IV-G）
     ├── run_sensing_uncertainty.m       # 传感不确定性（IV-H）
     ├── run_realtime.m                  # 实时性实验（IV-I）
-    ├── MHTA-CAMO-AC-RGVS                 # 实时性实验（IV-I）
+    ├── MHTA-CAMO-AC-RGVS               # 本文算法动态版（脚本版，带可视化）
+    ├── data                            # 动态实验数据文件夹
     └── obstacle_gradient_exp/
         ├── sim_rgvs.m                  # ★ 本文算法动态层 RGVS（权威）
         ├── sim_aapf.m / sim_avss.m     # 动态基线 A*+APF / AVSS-RRT

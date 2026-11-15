@@ -1,0 +1,7 @@
+Row,obstacles_2,obstacles_6,obstacles_11
+This algorithm,100,100,100
+AVSS_RRT,10,5,5
+A_APF,80,95,65
+VO,20,0,0
+RVO,10,0,0
+DWA,100,100,100
